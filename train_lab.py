@@ -1,21 +1,17 @@
-import sys
-sys.path.append('/Users/gxz/Desktop/PT/复杂系统/AIDD')
+# import sys
+# sys.path.append('/Users/gxz/Desktop/PT/复杂系统/AIDD')
 
-import numpy as np
-import pickle
-
-import torch
 import time
 import torch.nn.utils as U
 import torch.optim as optim
-from model import *
+from model_2 import *
 from tools import *
 import argparse
 import logging
 
+
 # configuration
 HYP = {
-    'node_size': 124,
     'hid': 128,  # hidden size
     'epoch_num': 1,  # epoch 1000
     'batch_size': 512,  # batch size 512
@@ -27,7 +23,6 @@ HYP = {
     'temp': 1,  # temperature
     'drop_frac': 1,  # temperature drop frac
 }
-
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--nodes', type=int, default=124, help='Number of nodes, default=10')
@@ -45,17 +40,21 @@ logging.basicConfig(format='%(asctime)s: %(message)s', level=logging.INFO)
 start_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 logging.info(f"start_time: {start_time}")
 
+# generator（网络生成器）
 generator = Gumbel_Generator_Old(
     sz=args.nodes, temp=HYP['temp'], temp_drop_frac=HYP['drop_frac']).to(device)
 generator.init(0, 0.1)
+# generator optimizer
 op_net = optim.Adam(generator.parameters(), lr=HYP['lr_net'])
 
+# dyn learner（动态学习器）
 dyn_isom = IO_B(args.dim, HYP['hid']).to(device)
+# dyn learner optimizer
 op_dyn = optim.Adam(dyn_isom.parameters(), lr=HYP['lr_dyn'])
 
-
+# load_data
 def load_lab(batch_size=128):
-    data_path = 'AIDD/AIDD/lab_array.pickle'
+    data_path = '/Users/gxz/pt/AIDD/AIDD/lab_array.pickle'
     with open(data_path, 'rb') as f:
         data = pickle.load(f)
     sample_cnt = data.shape[0]
@@ -64,52 +63,45 @@ def load_lab(batch_size=128):
 
     train_cnt = int(sample_cnt*8/10)
     train = data[:train_cnt]
-    test = data[train_cnt:]
-    train_loader = DataLoader(train, batch_size=batch_size, shuffle=True, num_workers=20)
-    test_loader = DataLoader(test, batch_size=batch_size, shuffle=False, num_workers=20)
+    # test = data[train_cnt:]
+    train_loader = DataLoader(train, batch_size=batch_size, shuffle=True)
+    # test_loader = DataLoader(test, batch_size=batch_size, shuffle=False, num_workers=3)
 
-    return train_loader, test_loader
+    return train_loader #, test_loader
 
-train_loader, _ = load_lab(batch_size=HYP['batch_size'])
+train_loader = load_lab(batch_size=HYP['batch_size'])
 
 
 def train_dyn_gen():
     loss_batch = []
     mse_batch = []
-    logging.info(f"current temp: {generator.temperature}")
     for idx, data in enumerate(train_loader):
-        logging.info(f"batch idx: {idx}")
-
+        logging.info(f"batch idx: {idx}")  # 每次抽取一组batch_size大小的数据进行训练
+        # data
         data = data.to(device)
-        x = data[:, :, 0, :]
-        y = data[:, :, 1, :]
+        x = data[:, :, 0, :]  # 将第一个时间节点作为x [nodes, sample, P, loc_vel]
+        y = data[:, :, 1, :]  # 将第二个时间节点作为y
+        # drop temperature
         generator.drop_temp()
-        outputs = torch.zeros(y.size(0), y.size(1), 1)
+        outputs = torch.zeros(y.size(0), y.size(1), 1)  # sample, nodes, dim(value)
         temp_x = x
 
         op_net.zero_grad()
         op_dyn.zero_grad()
 
-        num = int(args.nodes / HYP['node_size'])
-        remainder = int(args.nodes % HYP['node_size'])
-        if remainder == 0:
-            num = num - 1
-
-        for batch_i in range(x.size(0)):
+        for batch_i in range(x.size(0)):  # 每个sample时间间隔不等，需要逐sample进行predict
             predict_step = int(y[batch_i, 0, 0])
-            for s in range(predict_step):
-                cur_temp_x = temp_x[[batch_i], :, 1:]
-                for j in range(args.nodes):
-                    adj_col = generator.sample_adj_i(
-                        j, hard=HYP['hard_sample'],
-                        sample_time=HYP['sample_time']).to(device)
-                    y_hat = dyn_isom(
-                        cur_temp_x, adj_col, j, num, HYP['node_size'])
-                    temp_x[batch_i, j, 1:] = y_hat
+            for s in range(predict_step):  # 同一个sample所有nodes时间间隔相同
+                cur_temp_x = temp_x[[batch_i], :, 1:]  # 必须是3维 sample, nodes, dim
+                adj = generator.sample_all().to(device)
+                y_hat = dyn_isom(cur_temp_x, adj)
+                temp_x[batch_i, :, 1:] = y_hat
+
             outputs[[batch_i], :, :] = temp_x[[batch_i], :, 1:]
 
         loss = torch.mean(torch.abs(outputs - y[:, :, 1:].cpu()))
-        loss.backward()
+        loss.backward()  # backward and optimize
+        U.clip_grad_norm_(generator.gen_matrix, 0.000075)
 
         op_net.step()
         op_dyn.step()
@@ -127,41 +119,41 @@ def train_dyn_gen():
 
 
 if __name__ == '__main__':
+    # start training
     best_val_mse = 1000000
     best = 0
     best_loss = 10000000
 
+    # model save path
     dyn_path = f'./model_lab/dyn_{args.network}_{str(args.nodes)}.pkl'
     gen_path = f'./model_lab/gen_{args.network}_{str(args.nodes)}.pkl'
     adj_path = f'./model_lab/adj_{args.network}_{str(args.nodes)}.pkl'
 
+    # each training epoch
     for e in range(HYP['epoch_num']):
         logging.info(f"\nepoch: {e}")
         t_s = time.time()
-        t_s1 = time.time()
         try:
+            # train both dyn learner and generator together
             loss, mse = train_dyn_gen()
         except RuntimeError as sss:
             if 'out of memory' in str(sss):
-                logging.info('|WARNING: ran out of memory')
+                logging.warning('|WARNING: ran out of memory')
                 if hasattr(torch.cuda, 'empty_cache'):
                     torch.cuda.empty_cache()
             else:
                 raise sss
 
-        t_e1 = time.time()
         logging.info(f"loss: {str(loss)} mse: {str(mse)}")
-        logging.info(f"time for this dyn_adj epoch: {str(round(t_e1 - t_s1, 2))}")
 
         if loss < best_loss:
             logging.info(f"best epoch: {e}")
             best_loss = loss
             best = e
-            torch.save(dyn_isom,  dyn_path)
-            torch.save(generator, gen_path)
-            out_matrix = generator.sample_all(hard=HYP['hard_sample'], ).to(
-                device)
-            torch.save(out_matrix, adj_path)
+            torch.save(dyn_isom, dyn_path)  # 保存最优动力学模型(IO_B(n2e,e2e,n2n,output))
+            torch.save(generator, gen_path)  # 保存最优网络生成器(结果Gumbel_Gnerator.Old())
+            out_matrix = generator.sample_all(hard=HYP['hard_sample'], ).to(device)
+            torch.save(out_matrix, adj_path)  # 从网络生成器中提取邻接矩阵并保存。预测时不需要该矩阵（里面的值为预测为1时的概率）
         logging.info(f"best epoch: {best}")
         t_e = time.time()
         logging.info(f"time for this whole epoch: {str(round(t_e - t_s, 2))}")
